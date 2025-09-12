@@ -20,6 +20,35 @@ if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET || !SPOTIFY_REDIRECT_URI || !SE
   throw new Error("Missing required env vars.");
 }
 
+// ---- ADD: temporary in-memory store (replace with DB later) ----
+type StoredUser = {
+  access_token: string;
+  refresh_token: string;
+  token_expires_at: number; // epoch seconds
+  email?: string;
+  display_name?: string;
+};
+
+// Keyed by Spotify user ID
+const tokenStore = new Map<string, StoredUser>();
+
+function signAppJWT(sub: string, extra?: Record<string, any>) {
+  return jwt.sign(
+    { sub, ...(extra || {}) },
+    process.env.APP_JWT_SECRET!,
+    { expiresIn: "15m" }
+  );
+}
+
+// Verify incoming app JWT (from Authorization header)
+function requireAppUser(req: express.Request): { sub: string } {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!token) throw new Error("Missing bearer token");
+  const payload = jwt.verify(token, process.env.APP_JWT_SECRET!) as { sub: string };
+  return payload;
+}
+
 const app = express();
 
 // CORS for your RN app / Expo dev
@@ -125,28 +154,26 @@ app.get("/auth/callback", async (req, res) => {
     const { access_token, refresh_token, expires_in } = tokenRes.data;
     const now = Math.floor(Date.now() / 1000);
 
-    // Save in session if you want server-side proxying
-    sess.accessToken = access_token;
-    sess.refreshToken = refresh_token;
-    sess.tokenExpiresAt = now + expires_in - 30;
-
     // 🔎 NEW STEP: Fetch Spotify profile
     const meRes = await axios.get("https://api.spotify.com/v1/me", {
       headers: { Authorization: `Bearer ${access_token}` },
     });
     const spotifyUser = meRes.data; // { id, email, display_name, ... }
 
-    // ✅ Create app JWT with real Spotify ID
-    const appToken = jwt.sign(
-      {
-        sub: spotifyUser.id,       // unique Spotify user ID
-        email: spotifyUser.email,  // optional, include if you enabled `user-read-email`
-        name: spotifyUser.display_name,
-        scope: SCOPES,
-      },
-      process.env.APP_JWT_SECRET!,
-      { expiresIn: "15m" }
-    );
+    tokenStore.set(spotifyUser.id, {
+      access_token,
+      refresh_token,
+      token_expires_at: now + expires_in - 30,
+      email: spotifyUser.email,
+      display_name: spotifyUser.display_name,
+    });
+    
+    // ✅ Create short-lived app JWT tied to Spotify user id
+    const appToken = signAppJWT(spotifyUser.id, {
+      email: spotifyUser.email,
+      name: spotifyUser.display_name,
+      scope: SCOPES,
+    });
 
     // Redirect back to your app with the token
     const appScheme = process.env.APP_SCHEME || "nearby-spotify";
@@ -163,50 +190,73 @@ app.get("/auth/callback", async (req, res) => {
 // 3) Refresh endpoint (mobile app calls this when token is near expiry)
 app.post("/auth/refresh", async (req, res) => {
   try {
-    const sess = req.session as unknown as SessionData;
-    if (!sess.refreshToken) return res.status(401).json({ error: "No refresh token" });
+    const { sub } = requireAppUser(req); // verify current (maybe-expired-soon) app JWT
+    const user = tokenStore.get(sub);
+    if (!user) return res.status(401).json({ error: "No server session" });
 
+    // Refresh Spotify token unconditionally or based on expiry
     const body = new URLSearchParams({
       grant_type: "refresh_token",
-      refresh_token: sess.refreshToken,
+      refresh_token: user.refresh_token,
       client_id: SPOTIFY_CLIENT_ID!,
       client_secret: SPOTIFY_CLIENT_SECRET!,
     });
-
     const tokenRes = await axios.post(TOKEN_URL, body.toString(), {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
     });
-
     const { access_token, expires_in, refresh_token } = tokenRes.data;
-    const now = Math.floor(Date.now() / 1000);
 
-    sess.accessToken = access_token;
-    if (refresh_token) sess.refreshToken = refresh_token; // sometimes Spotify rotates
-    sess.tokenExpiresAt = now + expires_in - 30;
+    user.access_token = access_token;
+    if (refresh_token) user.refresh_token = refresh_token;
+    user.token_expires_at = Math.floor(Date.now() / 1000) + expires_in - 30;
+    tokenStore.set(sub, user);
 
-    res.json({
-      accessToken: sess.accessToken,
-      expiresAt: sess.tokenExpiresAt,
+    // 👉 Return a fresh short-lived app JWT
+    const newAppToken = signAppJWT(sub, {
+      email: user.email,
+      name: user.display_name,
+      scope: SCOPES,
     });
+
+    return res.json({ token: newAppToken });
   } catch (e: any) {
     console.error("Refresh error", e.response?.data || e.message);
-    res.status(500).json({ error: "Refresh failed" });
+    return res.status(401).json({ error: "Refresh failed" });
   }
 });
 
 // 4) Example API proxy to test auth
 app.get("/api/me", async (req, res) => {
-  const sess = req.session as unknown as SessionData;
-  if (!sess.accessToken) return res.status(401).json({ error: "Not authenticated" });
-
   try {
+    const { sub } = requireAppUser(req); // read user id from app JWT
+    const user = tokenStore.get(sub);
+    if (!user) return res.status(401).json({ error: "Not authenticated" });
+
+    // Refresh if expired (optional here; you can also just try/catch 401 from Spotify)
+    if (Math.floor(Date.now() / 1000) >= user.token_expires_at) {
+      // perform refresh
+      const body = new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: user.refresh_token,
+        client_id: SPOTIFY_CLIENT_ID!,
+        client_secret: SPOTIFY_CLIENT_SECRET!,
+      });
+      const tokenRes = await axios.post(TOKEN_URL, body.toString(), {
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      });
+      const { access_token, expires_in, refresh_token } = tokenRes.data;
+      user.access_token = access_token;
+      if (refresh_token) user.refresh_token = refresh_token;
+      user.token_expires_at = Math.floor(Date.now() / 1000) + expires_in - 30;
+      tokenStore.set(sub, user);
+    }
+
     const me = await axios.get("https://api.spotify.com/v1/me", {
-      headers: { Authorization: `Bearer ${sess.accessToken}` },
+      headers: { Authorization: `Bearer ${user.access_token}` },
     });
-    res.json(me.data);
+    return res.json(me.data);
   } catch (e: any) {
-    console.error("Spotify /me error", e.response?.data || e.message);
-    res.status(500).json({ error: "Spotify request failed" });
+    return res.status(401).json({ error: "Unauthorized" });
   }
 });
 
