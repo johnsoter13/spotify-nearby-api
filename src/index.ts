@@ -6,6 +6,8 @@ import cookieParser from "cookie-parser";
 import axios from "axios";
 import { generateCodeVerifier, generateCodeChallenge, randomState } from "./pkce";
 import jwt from "jsonwebtoken";
+import { prisma } from "./db";
+
 
 const {
   SPOTIFY_CLIENT_ID,
@@ -19,18 +21,6 @@ const {
 if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET || !SPOTIFY_REDIRECT_URI || !SESSION_SECRET) {
   throw new Error("Missing required env vars.");
 }
-
-// ---- ADD: temporary in-memory store (replace with DB later) ----
-type StoredUser = {
-  access_token: string;
-  refresh_token: string;
-  token_expires_at: number; // epoch seconds
-  email?: string;
-  display_name?: string;
-};
-
-// Keyed by Spotify user ID
-const tokenStore = new Map<string, StoredUser>();
 
 function signAppJWT(sub: string, extra?: Record<string, any>) {
   return jwt.sign(
@@ -160,12 +150,25 @@ app.get("/auth/callback", async (req, res) => {
     });
     const spotifyUser = meRes.data; // { id, email, display_name, ... }
 
-    tokenStore.set(spotifyUser.id, {
-      access_token,
-      refresh_token,
-      token_expires_at: now + expires_in - 30,
-      email: spotifyUser.email,
-      display_name: spotifyUser.display_name,
+    await prisma.user.upsert({
+      where: { id: spotifyUser.id },
+      update: {
+        email: spotifyUser.email,
+        displayName: spotifyUser.display_name,
+        avatarUrl: spotifyUser.images?.[0]?.url,
+        accessToken: access_token,
+        refreshToken: refresh_token,
+        tokenExpiresAt: new Date(now * 1000 + expires_in * 1000),
+      },
+      create: {
+        id: spotifyUser.id,
+        email: spotifyUser.email,
+        displayName: spotifyUser.display_name,
+        avatarUrl: spotifyUser.images?.[0]?.url,
+        accessToken: access_token,
+        refreshToken: refresh_token,
+        tokenExpiresAt: new Date(now * 1000 + expires_in * 1000),
+      },
     });
     
     // ✅ Create short-lived app JWT tied to Spotify user id
@@ -190,73 +193,123 @@ app.get("/auth/callback", async (req, res) => {
 // 3) Refresh endpoint (mobile app calls this when token is near expiry)
 app.post("/auth/refresh", async (req, res) => {
   try {
-    const { sub } = requireAppUser(req); // verify current (maybe-expired-soon) app JWT
-    const user = tokenStore.get(sub);
-    if (!user) return res.status(401).json({ error: "No server session" });
+    const { sub } = requireAppUser(req);
+    const user = await prisma.user.findUnique({ where: { id: sub } });
 
-    // Refresh Spotify token unconditionally or based on expiry
+    if (!user || !user.refreshToken)
+      return res.status(401).json({ error: "No refresh token" });
+
     const body = new URLSearchParams({
       grant_type: "refresh_token",
-      refresh_token: user.refresh_token,
+      refresh_token: user.refreshToken,
       client_id: SPOTIFY_CLIENT_ID!,
       client_secret: SPOTIFY_CLIENT_SECRET!,
     });
+
     const tokenRes = await axios.post(TOKEN_URL, body.toString(), {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
     });
+
     const { access_token, expires_in, refresh_token } = tokenRes.data;
+    const newExpires = new Date(Date.now() + expires_in * 1000);
 
-    user.access_token = access_token;
-    if (refresh_token) user.refresh_token = refresh_token;
-    user.token_expires_at = Math.floor(Date.now() / 1000) + expires_in - 30;
-    tokenStore.set(sub, user);
+    await prisma.user.update({
+      where: { id: sub },
+      data: {
+        accessToken: access_token,
+        tokenExpiresAt: newExpires,
+        ...(refresh_token && { refreshToken: refresh_token }),
+      },
+    });
 
-    // 👉 Return a fresh short-lived app JWT
     const newAppToken = signAppJWT(sub, {
       email: user.email,
-      name: user.display_name,
+      name: user.displayName,
       scope: SCOPES,
     });
 
-    return res.json({ token: newAppToken });
+    res.json({ token: newAppToken });
   } catch (e: any) {
-    console.error("Refresh error", e.response?.data || e.message);
-    return res.status(401).json({ error: "Refresh failed" });
+    res.status(401).json({ error: "Refresh failed" });
   }
 });
 
 // 4) Example API proxy to test auth
 app.get("/api/me", async (req, res) => {
   try {
-    const { sub } = requireAppUser(req); // read user id from app JWT
-    const user = tokenStore.get(sub);
-    if (!user) return res.status(401).json({ error: "Not authenticated" });
+    const { sub } = requireAppUser(req); // Spotify user ID from JWT
+    const user = await prisma.user.findUnique({ where: { id: sub } });
 
-    // Refresh if expired (optional here; you can also just try/catch 401 from Spotify)
-    if (Math.floor(Date.now() / 1000) >= user.token_expires_at) {
-      // perform refresh
-      const body = new URLSearchParams({
-        grant_type: "refresh_token",
-        refresh_token: user.refresh_token,
-        client_id: SPOTIFY_CLIENT_ID!,
-        client_secret: SPOTIFY_CLIENT_SECRET!,
-      });
-      const tokenRes = await axios.post(TOKEN_URL, body.toString(), {
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      });
-      const { access_token, expires_in, refresh_token } = tokenRes.data;
-      user.access_token = access_token;
-      if (refresh_token) user.refresh_token = refresh_token;
-      user.token_expires_at = Math.floor(Date.now() / 1000) + expires_in - 30;
-      tokenStore.set(sub, user);
-    }
+    if (!user) return res.status(401).json({ error: "User not found" });
 
-    const me = await axios.get("https://api.spotify.com/v1/me", {
-      headers: { Authorization: `Bearer ${user.access_token}` },
+    res.json({
+      id: user.id,
+      email: user.email,
+      displayName: user.displayName,
+      avatarUrl: user.avatarUrl,
     });
-    return res.json(me.data);
-  } catch (e: any) {
-    return res.status(401).json({ error: "Unauthorized" });
+  } catch (e) {
+    res.status(401).json({ error: "Unauthorized" });
+  }
+});
+
+app.post("/api/listening", async (req, res) => {
+  try {
+    const { sub } = requireAppUser(req);
+    const { trackName, artistName, spotifyId, genre, energy, latitude, longitude } = req.body;
+
+    const session = await prisma.listeningSession.create({
+      data: {
+        userId: sub,
+        trackName,
+        artistName,
+        spotifyId,
+        genre,
+        energy,
+        latitude,
+        longitude,
+      },
+    });
+
+    res.json(session);
+  } catch {
+    res.status(500).json({ error: "Failed to save listening session" });
+  }
+});
+
+app.get("/api/listening/nearby", async (req, res) => {
+  try {
+    const { lat, lng, radius = 500 } = req.query;
+    if (!lat || !lng) return res.status(400).json({ error: "Missing lat/lng" });
+
+    const latNum = parseFloat(lat as string);
+    const lngNum = parseFloat(lng as string);
+
+    const sessions = await prisma.listeningSession.findMany({
+      where: {
+        createdAt: { gte: new Date(Date.now() - 1000 * 60 * 30) }, // last 30 min
+      },
+      include: { user: true },
+    });
+
+    // naive distance filter (upgrade to PostGIS later)
+    const R = 6371000;
+    const nearby = sessions.filter((s: any) => {
+      if (!s.latitude || !s.longitude) return false;
+      const dLat = (s.latitude - latNum) * (Math.PI / 180);
+      const dLng = (s.longitude - lngNum) * (Math.PI / 180);
+      const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(latNum * Math.PI / 180) *
+          Math.cos(s.latitude * Math.PI / 180) *
+          Math.sin(dLng / 2) ** 2;
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return R * c <= Number(radius);
+    });
+
+    res.json(nearby);
+  } catch {
+    res.status(500).json({ error: "Failed to fetch nearby listeners" });
   }
 });
 
