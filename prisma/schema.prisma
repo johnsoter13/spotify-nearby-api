@@ -25,15 +25,27 @@ model User {
 }
 
 model ListeningSession {
-  id          String   @id @default(uuid())
-  userId      String
-  user        User     @relation(fields: [userId], references: [id])
-  trackName   String
-  artistName  String
-  spotifyId   String
-  genre       String?
-  energy      Int?
-  latitude    Float?
-  longitude   Float?
-  createdAt   DateTime @default(now())
+  id            String   @id @default(uuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+
+  spotifyId     String
+  trackName     String
+  artistName    String
+  genre         String?
+  energy        Int?
+
+  latitude      Float?
+  longitude     Float?
+
+  startedAt     DateTime // when the track started playing
+  endedAt       DateTime // startedAt + duration
+
+  source        String?  // "now-playing" | "recently-played" | "manual"
+  clientAt      DateTime? // when client captured the event
+  createdAt     DateTime  @default(now())
+
+  @@index([userId, startedAt])
+  @@index([latitude, longitude, startedAt])
+  // (When you move to PostGIS you’ll add a geo index instead)
 }
